@@ -12,7 +12,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY . .
 # If you want to ship the checkpoint inside the image:
 # COPY models/densnet_pneu_best.pt models/densnet_pneu_best.pt
 
