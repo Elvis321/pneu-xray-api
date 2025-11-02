@@ -1,10 +1,11 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
 fastapi
-uvicorn[standard]
+uvicorn
+torch==2.4.1
+torchvision==0.19.1
+python-multipart
 pillow
 numpy
 requests
-python-multipart
-torch==2.4.1
-torchvision==0.19.1
+gdown
