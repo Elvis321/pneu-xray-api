@@ -1,3 +1,6 @@
+from app_bootstrap import ensure_model_present, MODEL_PATH
+ensure_model_present()
+
 import os, io, hashlib, tempfile, base64, requests
 from typing import Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
