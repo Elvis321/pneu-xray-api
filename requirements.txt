@@ -1,0 +1,8 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+numpy==1.26.4
+pillow==10.4.0
+torch==2.3.1        # if host is CPU only; change to match your platform
+torchvision==0.18.1
+requests==2.32.3
