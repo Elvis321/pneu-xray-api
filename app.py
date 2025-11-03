@@ -1,4 +1,6 @@
 # app.py
+import requests
+from pydantic import BaseModel, HttpUrl
 import os, io
 from typing import List, Tuple, Dict, Optional
 
