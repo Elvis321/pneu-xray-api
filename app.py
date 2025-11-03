@@ -1,181 +1,171 @@
-from app_bootstrap import ensure_model_present, MODEL_PATH
-ensure_model_present()
+# app.py
+import os
+import io
+from typing import List, Tuple, Dict
 
-import os, io, hashlib, tempfile, base64, requests
-from typing import Optional
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision import models, transforms as T
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import numpy as np
-from PIL import Image
+from app_bootstrap import ensure_model_present, MODEL_PATH
 
-import torch
-import torch.nn as nn
-import torchvision.transforms as T
-from torchvision import models as tvm
+# --------------------------- FastAPI app ---------------------------
+app = FastAPI(title="Pneumonia X-ray API", version="1.0")
 
-# --------- Config ---------
-MODEL_PATH = os.getenv("XRAY_MODEL_PATH", "models/densnet_pneu_best.pt")
-ALLOWED_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
-DEVICE = "cpu"  # simple & portable; switch to "cuda" if your host has a GPU
-PORT = int(os.getenv("PORT", "8080"))
-
-# --------- App & CORS ---------
-app = FastAPI(title="Pneumonia Xray API", version="1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS != ["*"] else ["*"],
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------- I/O Schemas ---------
-class PredictResp(BaseModel):
-    probability: float
-    label: str
-    num_classes: int
+# --------------------------- Labels ---------------------------
+PATTERN_KEYS = ["pattern_alveolar", "pattern_interstitial", "pattern_broncho"]
+LOBE_KEYS    = ["loc_rul", "loc_rml", "loc_rll", "loc_lul", "loc_lll",
+                "loc_right", "loc_left", "loc_bilateral"]
+FALLBACK_LABELS = PATTERN_KEYS + LOBE_KEYS
 
-# --------- Utils ---------
-def _http_or_local_bytes(path_or_url: str) -> bytes:
-    if path_or_url.startswith(("http://", "https://")):
-        r = requests.get(path_or_url, timeout=120)
-        if r.status_code != 200:
-            raise FileNotFoundError(f"HTTP {r.status_code} when fetching {path_or_url}")
-        return r.content
-    with open(path_or_url, "rb") as f:
-        return f.read()
+# --------------------------- Model init ---------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_model: torch.nn.Module = None
+_label_names: List[str] = FALLBACK_LABELS
 
-def _ensure_model_file(path_or_url: str) -> str:
-    """Download to /tmp once if it's a URL; return local file path."""
-    if not path_or_url.startswith(("http://", "https://")):
-        return path_or_url
-    key = hashlib.sha256(path_or_url.encode()).hexdigest()[:24]
-    dst = os.path.join(tempfile.gettempdir(), f"xray_{key}.pt")
-    if not os.path.exists(dst):
-        raw = _http_or_local_bytes(path_or_url)
-        with open(dst, "wb") as f:
-            f.write(raw)
-    return dst
-
-def _build_densenet(num_classes: int) -> nn.Module:
-    m = tvm.densenet121(weights=None)
-    in_feats = m.classifier.in_features
-    m.classifier = nn.Linear(in_feats, num_classes)
+def _build_empty_model(num_labels: int) -> torch.nn.Module:
+    try:
+        weights = models.DenseNet121_Weights.IMAGENET1K_V1
+        m = models.densenet121(weights=weights)
+    except Exception:
+        # for older torch/torchvision
+        m = models.densenet121(pretrained=True)
+    in_features = m.classifier.in_features
+    m.classifier = nn.Linear(in_features, num_labels)
     return m
 
-def _infer_num_classes_from_state_dict(sd: dict) -> int:
-    # Try common keys for DenseNet classifier
-    for k in ("classifier.weight", "module.classifier.weight", "model.classifier.weight"):
-        if k in sd and sd[k].ndim == 2:
-            return sd[k].shape[0]
-    # Fallback: 1
-    return 1
+def _sigmoid_np(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
 
-# --------- Model load ---------
-XRAY_MODEL: Optional[nn.Module] = None
-XRAY_NUM_CLASSES: int = 1
+def _load_checkpoint(path: str) -> Tuple[torch.nn.Module, List[str]]:
+    ck = torch.load(path, map_location=DEVICE)
+    # try to fetch label names; otherwise fall back
+    label_names = ck.get("label_names", FALLBACK_LABELS) if isinstance(ck, dict) else FALLBACK_LABELS
+    num_labels = len(label_names)
 
-def _load_model() -> None:
-    global XRAY_MODEL, XRAY_NUM_CLASSES
-    local_path = _ensure_model_file(MODEL_PATH)
-    ckpt = torch.load(local_path, map_location="cpu")
+    model = _build_empty_model(num_labels)
+    state = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
+    model.load_state_dict(state, strict=True)
+    model.to(DEVICE).eval()
+    return model, label_names
 
-    # ckpt can be a state_dict or a dict with 'state_dict'/'model'/...
-    if isinstance(ckpt, dict) and any(k in ckpt for k in ("state_dict", "model", "net")):
-        state_dict = ckpt.get("state_dict") or ckpt.get("model") or ckpt.get("net")
-    elif isinstance(ckpt, dict):
-        state_dict = ckpt
-    else:
-        raise RuntimeError("Unsupported checkpoint format")
-
-    XRAY_NUM_CLASSES = _infer_num_classes_from_state_dict(state_dict)
-    model = _build_densenet(XRAY_NUM_CLASSES)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval().to(DEVICE)
-    XRAY_MODEL = model
-
-# Preprocessing (ImageNet stats; works for DenseNet pretrained pipelines)
-TFM = T.Compose([
-    T.Resize(256, interpolation=T.InterpolationMode.BILINEAR),
+# preprocessing must mirror training
+_mean = [0.485, 0.456, 0.406]
+_std  = [0.229, 0.224, 0.225]
+_infer_tfms = T.Compose([
+    T.Grayscale(num_output_channels=3),
+    T.Resize(256),
     T.CenterCrop(224),
     T.ToTensor(),
-    T.Normalize(mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]),
+    T.Normalize(_mean, _std),
 ])
 
-def _pil_from_any(img_bytes: bytes) -> Image.Image:
-    im = Image.open(io.BytesIO(img_bytes)).convert("RGB")  # handles grayscale & PNG with alpha
-    return im
+# --------------------------- I/O schemas ---------------------------
+class TopProb(BaseModel):
+    label: str
+    prob: float
 
-def _predict_pneumonia(img_bytes: bytes) -> PredictResp:
-    if XRAY_MODEL is None:
-        try:
-            _load_model()
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Model not available: {e}")
+class PredictResp(BaseModel):
+    top: List[TopProb]
+    on_threshold: List[TopProb]
+    raw: Dict[str, float]  # label -> prob
 
-    pil = _pil_from_any(img_bytes)
-    x = TFM(pil).unsqueeze(0).to(DEVICE)
+# --------------------------- Helpers ---------------------------
+def _ensure_loaded():
+    global _model, _label_names
+    if _model is not None:
+        return
+    # make sure model file exists & is valid (handled by app_bootstrap checks)
+    ensure_model_present()
+    try:
+        _model, _label_names = _load_checkpoint(MODEL_PATH)
+    except Exception as e:
+        # Surface a clean error like you saw before, but clearer
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model not available: {e}"
+        )
 
-    with torch.no_grad():
-        logits = XRAY_MODEL(x)
+@torch.no_grad()
+def _predict_pil(img: Image.Image, topk: int, thresh: float) -> PredictResp:
+    x = _infer_tfms(img.convert("L")).unsqueeze(0).to(DEVICE)
+    logits = _model(x).squeeze(0).detach().cpu().numpy()
+    probs = _sigmoid_np(logits)
 
-    if logits.ndim == 2 and logits.shape[1] == 1:
-        # single logit -> sigmoid
-        prob = torch.sigmoid(logits)[0, 0].item()
-        label = "pneumonia" if prob >= 0.5 else "normal"
-        return PredictResp(probability=float(prob), label=label, num_classes=1)
+    # sort by prob desc
+    order = np.argsort(-probs)[:topk]
+    top = [TopProb(label=_label_names[i], prob=float(probs[i])) for i in order]
 
-    if logits.ndim == 2 and logits.shape[1] >= 2:
-        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
-        # Assume class index 1 = pneumonia if 2 classes; otherwise choose max
-        if logits.shape[1] == 2:
-            prob = float(probs[1])
-            label = "pneumonia" if prob >= 0.5 else "normal"
-        else:
-            idx = int(np.argmax(probs))
-            prob = float(probs[idx])
-            label = f"class_{idx}"
-        return PredictResp(probability=prob, label=label, num_classes=logits.shape[1])
+    on_idx = np.where(probs >= thresh)[0]
+    on = [TopProb(label=_label_names[i], prob=float(probs[i])) for i in on_idx]
 
-    raise HTTPException(status_code=500, detail="Unexpected model output shape.")
+    raw = { _label_names[i]: float(probs[i]) for i in range(len(_label_names)) }
 
-# --------- Routes ---------
+    return PredictResp(top=top, on_threshold=on, raw=raw)
+
+# --------------------------- Routes ---------------------------
 @app.get("/healthz")
 def healthz():
-    ok = True
     try:
-        if XRAY_MODEL is None:
-            _load_model()
-    except Exception:
-        ok = False
-    return {"ok": ok, "model_loaded": XRAY_MODEL is not None, "num_classes": XRAY_NUM_CLASSES}
+        _ensure_loaded()
+        return {"ok": True, "device": DEVICE, "labels": _label_names}
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/labels")
+def labels():
+    _ensure_loaded()
+    return {"labels": _label_names}
 
 @app.post("/predict/xray", response_model=PredictResp)
 async def predict_xray(
-    file: UploadFile | None = File(default=None, description="X-ray image file"),
-    image_base64: str | None = Form(default=None, description="Base64-encoded image"),
+    file: UploadFile = File(..., description="Chest X-ray image (JPG/PNG/TIFF)"),
+    topk: int = Query(10, ge=1, le=64, description="How many top probabilities to return"),
+    thresh: float = Query(0.50, ge=0.0, le=1.0, description="Probability threshold for 'on_threshold'")
 ):
     """
-    Either upload `file` (multipart/form-data) or send `image_base64` in a form field.
+    Accepts a single image file and returns:
+      - top: top-K probabilities (label, prob)
+      - on_threshold: labels whose prob >= thresh (default 0.50)
+      - raw: dict[label] = probability
     """
-    if file is None and image_base64 is None:
-        raise HTTPException(status_code=400, detail="Provide file OR image_base64")
+    _ensure_loaded()
 
     try:
-        if file is not None:
-            img_bytes = await file.read()
-        else:
-            img_bytes = base64.b64decode(image_base64, validate=True)
+        content = await file.read()
+        if not content:
+            raise ValueError("Empty file.")
+        img = Image.open(io.BytesIO(content))
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image input: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
 
-    return _predict_pneumonia(img_bytes)
+    try:
+        resp = _predict_pil(img, topk=topk, thresh=thresh)
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
 
-# Entrypoint (for Docker/Render)
+# --------------------------- Dev entrypoint ---------------------------
 if __name__ == "__main__":
+    # local dev: uvicorn app:app --reload --port 8080
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
-
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
