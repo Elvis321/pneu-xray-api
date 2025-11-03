@@ -9,3 +9,4 @@ pillow
 numpy
 requests
 gdown
+httpx
