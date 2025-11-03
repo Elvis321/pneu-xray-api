@@ -127,7 +127,7 @@ def _predict_pil(img: Image.Image, topk: int, thresh: float) -> PredictResp:
     on_idx = np.where(probs >= thresh)[0]
     on = [TopProb(label=_label_names[i], prob=float(probs[i])) for i in on_idx]
 
-    raw = { _label_names[i]: float(probs[i])) for i in range(len(_label_names)) }
+    raw = { _label_names[i]: float(probs[i]) for i in range(len(_label_names)) }
 
     return PredictResp(top=top, on_threshold=on, raw=raw)
 
