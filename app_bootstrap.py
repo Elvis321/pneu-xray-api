@@ -2,7 +2,7 @@
 import os, io, sys, re, hashlib
 from pathlib import Path
 
-MODEL_PATH = os.getenv("XRAY_MODEL_PATH", "models/densnet_pneu_best.pt")
+MODEL_PATH = os.getenv("XRAY_MODEL_PATH", "models/densenet_pneu_best(2).pt")
 MODEL_URL  = os.getenv("XRAY_MODEL_URL", "")          # e.g. https://.../densnet_pneu_best.pt
 GDRIVE_ID  = os.getenv("XRAY_MODEL_GDRIVE_ID", "")    # e.g. 1AbCdefGhIJ...
 
